@@ -8,3 +8,4 @@ lightgbm
 xgboost
 scipy
 tqdm
+catboost
