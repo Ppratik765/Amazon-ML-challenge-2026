@@ -1,0 +1,8 @@
+dataset/
+output/
+student_resource/
+__pycache__/
+*.pyc
+*.zip
+model.pkl
+thresholds.json

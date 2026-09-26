@@ -1,0 +1,10 @@
+pandas
+numpy
+unidecode
+scikit-learn
+sentence-transformers
+faiss-cpu
+lightgbm
+xgboost
+scipy
+tqdm
