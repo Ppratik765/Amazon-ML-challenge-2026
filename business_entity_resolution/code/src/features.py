@@ -1,124 +1,187 @@
 import pandas as pd
 import numpy as np
-import Levenshtein
-from sentence_transformers import SentenceTransformer
-from scipy.spatial.distance import cosine
+from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein, JaroWinkler
 from tqdm import tqdm
 
-def jaccard_set(s1, s2):
+tqdm.pandas()
+
+
+def _jaccard_row(pair):
+    s1, s2 = pair
     if not s1 and not s2:
         return 1.0
     if not s1 or not s2:
         return 0.0
-    return len(s1.intersection(s2)) / len(s1.union(s2))
+    return len(s1 & s2) / len(s1 | s2)
 
-def token_sort_ratio(s1, s2):
-    t1 = " ".join(sorted(str(s1).split()))
-    t2 = " ".join(sorted(str(s2).split()))
-    return Levenshtein.ratio(t1, t2)
 
-def token_set_ratio(s1, s2):
-    set1 = set(str(s1).split())
-    set2 = set(str(s2).split())
-    intersection = set1.intersection(set2)
-    diff1 = set1 - intersection
-    diff2 = set2 - intersection
-    
-    t_inter = " ".join(sorted(intersection))
-    t1 = " ".join(sorted(intersection.union(diff1)))
-    t2 = " ".join(sorted(intersection.union(diff2)))
-    
-    return max([
-        Levenshtein.ratio(t_inter, t1),
-        Levenshtein.ratio(t_inter, t2),
-        Levenshtein.ratio(t1, t2)
-    ])
+def _acronym(text):
+    return "".join(w[0] for w in str(text).split() if w)
 
-def first_token_match(s1, s2):
-    t1 = str(s1).split()
-    t2 = str(s2).split()
-    if not t1 or not t2:
-        return 0
-    return 1 if t1[0] == t2[0] else 0
 
-def acronym_match(s1, s2):
-    t1 = "".join([w[0] for w in str(s1).split() if w])
-    t2 = "".join([w[0] for w in str(s2).split() if w])
-    if t1 and t2 and (t1 == str(s2) or t2 == str(s1)):
-        return 1
-    return 0
-    
 class FeatureExtractor:
-    def __init__(self):
-        self.model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-        
-    def get_features(self, df_pairs, df_s1, df_cand):
-        df_s1_idx = df_s1.set_index('entity_id')
-        df_cand_idx = df_cand.set_index('entity_id')
-        
-        s1_names = df_s1['clean_name'].fillna('').tolist()
-        s1_addrs = df_s1['clean_address'].fillna('').tolist()
-        cand_names = df_cand['clean_name'].fillna('').tolist()
-        cand_addrs = df_cand['clean_address'].fillna('').tolist()
-        
-        s1_name_emb = {id_: emb for id_, emb in zip(df_s1['entity_id'], self.model.encode(s1_names, batch_size=256))}
-        s1_addr_emb = {id_: emb for id_, emb in zip(df_s1['entity_id'], self.model.encode(s1_addrs, batch_size=256))}
-        cand_name_emb = {id_: emb for id_, emb in zip(df_cand['entity_id'], self.model.encode(cand_names, batch_size=256))}
-        cand_addr_emb = {id_: emb for id_, emb in zip(df_cand['entity_id'], self.model.encode(cand_addrs, batch_size=256))}
-        
-        features = []
-        for _, row in tqdm(df_pairs.iterrows(), total=len(df_pairs), desc="Extracting Features"):
-            s1_id = row['source1_entity_id']
-            c_id = row['candidate_entity_id']
-            
-            s1_row = df_s1_idx.loc[s1_id]
-            c_row = df_cand_idx.loc[c_id]
-            
-            n1 = str(s1_row.get('clean_name', ''))
-            n2 = str(c_row.get('clean_name', ''))
-            a1 = str(s1_row.get('clean_address', ''))
-            a2 = str(c_row.get('clean_address', ''))
-            
-            feat = {
-                'source1_entity_id': s1_id,
-                'candidate_entity_id': c_id,
-                'name_lev_dist': Levenshtein.distance(n1, n2),
-                'name_lev_ratio': Levenshtein.ratio(n1, n2),
-                'name_jaro_winkler': Levenshtein.jaro_winkler(n1, n2),
-                'name_token_sort': token_sort_ratio(n1, n2),
-                'name_token_set': token_set_ratio(n1, n2),
-                'addr_lev_dist': Levenshtein.distance(a1, a2),
-                'addr_lev_ratio': Levenshtein.ratio(a1, a2),
-                'addr_jaro_winkler': Levenshtein.jaro_winkler(a1, a2),
-                'name_exact_match': int(n1 == n2 and n1 != ""),
-                'addr_exact_match': int(a1 == a2 and a1 != ""),
-                'name_first_token': first_token_match(n1, n2),
-                'name_acronym_match': acronym_match(n1, n2),
-            }
-            
-            nums1_n = s1_row.get('nums_name', set())
-            nums2_n = c_row.get('nums_name', set())
-            nums1_a = s1_row.get('nums_address', set())
-            nums2_a = c_row.get('nums_address', set())
-            
-            feat['nums_name_jaccard'] = jaccard_set(nums1_n, nums2_n)
-            feat['nums_addr_jaccard'] = jaccard_set(nums1_a, nums2_a)
-            
-            feat['nums_overlap_count'] = len(nums1_n.intersection(nums2_n)) + len(nums1_a.intersection(nums2_a))
-            feat['nums_conflict_flag'] = int((len(nums1_a) > 0 and len(nums2_a) > 0 and feat['nums_addr_jaccard'] < 1.0))
-            
-            emb_n1 = s1_name_emb[s1_id]
-            emb_n2 = cand_name_emb[c_id]
-            emb_a1 = s1_addr_emb[s1_id]
-            emb_a2 = cand_addr_emb[c_id]
-            
-            feat['name_emb_cos'] = 1 - cosine(emb_n1, emb_n2) if np.any(emb_n1) and np.any(emb_n2) else 0.0
-            feat['addr_emb_cos'] = 1 - cosine(emb_a1, emb_a2) if np.any(emb_a1) and np.any(emb_a2) else 0.0
-            
-            feat['target_source'] = 1 if c_id.startswith('S2') else 2
-            feat['name_len_diff_ratio'] = abs(len(n1) - len(n2)) / max(1, max(len(n1), len(n2)))
-            feat['addr_len_diff_ratio'] = abs(len(a1) - len(a2)) / max(1, max(len(a1), len(a2)))
-            
-            features.append(feat)
-            
-        return pd.DataFrame(features)
+    """
+    Computes pairwise similarity features for (source1, candidate) pairs.
+
+    Fully vectorized: the original implementation looped over df_pairs.iterrows()
+    and did per-row dict lookups for every feature, which does not scale past a few
+    tens of thousands of pairs. This version merges S1/candidate attributes into the
+    pairs frame once, then computes every feature as a column operation (rapidfuzz
+    calls are still one-per-pair under the hood, but that's an unavoidable C-level
+    string comparison, not the Python-level overhead the old row loop added on top).
+
+    Accepts optional `embeddings` (entity_id -> vector) and `pair_scores_df`
+    (source1_entity_id, candidate_entity_id, tfidf_score, dense_score) produced by
+    BlockingEngine, so text does not get re-encoded a second time here.
+    """
+
+    def __init__(self, embedding_model_name='sentence-transformers/all-MiniLM-L6-v2'):
+        self.embedding_model_name = embedding_model_name
+        self._st_model = None
+
+    def _get_st_model(self):
+        if self._st_model is None:
+            from sentence_transformers import SentenceTransformer
+            self._st_model = SentenceTransformer(self.embedding_model_name)
+        return self._st_model
+
+    def _ensure_embeddings(self, df_s1, df_cand, embeddings):
+        """Fallback path: compute name/address embeddings if the caller didn't pass
+        ones already computed during blocking. Prefer passing them in -- encoding
+        the same text twice (once in BlockingEngine, once here) wastes real time at
+        scale for zero benefit."""
+        if embeddings is not None:
+            return embeddings
+        model = self._get_st_model()
+        name_texts = pd.concat([df_s1['clean_name'], df_cand['clean_name']]).fillna('').tolist()
+        addr_texts = pd.concat([df_s1['clean_address'], df_cand['clean_address']]).fillna('').tolist()
+        all_ids = pd.concat([df_s1['entity_id'], df_cand['entity_id']]).tolist()
+        name_emb = model.encode(name_texts, batch_size=256, show_progress_bar=True)
+        addr_emb = model.encode(addr_texts, batch_size=256, show_progress_bar=True)
+        emb = {}
+        for i, eid in enumerate(all_ids):
+            v = np.concatenate([name_emb[i], addr_emb[i]])
+            emb[eid] = v
+        return emb
+
+    def get_features(self, df_pairs, df_s1, df_cand, embeddings=None, pair_scores_df=None):
+        if df_pairs.empty:
+            return pd.DataFrame(columns=['source1_entity_id', 'candidate_entity_id'])
+
+        s1_cols = ['entity_id', 'clean_name', 'clean_address', 'nums_name', 'nums_address',
+                   'street_num', 'postal_code', 'country_norm']
+        cand_cols = s1_cols
+        s1_small = df_s1[[c for c in s1_cols if c in df_s1.columns]].add_prefix('s1_')
+        cand_small = df_cand[[c for c in cand_cols if c in df_cand.columns]].add_prefix('c_')
+
+        df = df_pairs.merge(s1_small, left_on='source1_entity_id', right_on='s1_entity_id', how='left')
+        df = df.merge(cand_small, left_on='candidate_entity_id', right_on='c_entity_id', how='left')
+
+        n1 = df['s1_clean_name'].fillna('').astype(str)
+        n2 = df['c_clean_name'].fillna('').astype(str)
+        a1 = df['s1_clean_address'].fillna('').astype(str)
+        a2 = df['c_clean_address'].fillna('').astype(str)
+
+        feat = pd.DataFrame(index=df.index)
+        feat['source1_entity_id'] = df['source1_entity_id']
+        feat['candidate_entity_id'] = df['candidate_entity_id']
+
+        # --- string similarity (rapidfuzz; C-implemented, much faster than the
+        # original pure-python Levenshtein + hand-rolled token_sort/token_set) ---
+        feat['name_lev_dist'] = [Levenshtein.distance(x, y) for x, y in zip(n1, n2)]
+        feat['name_lev_ratio'] = [fuzz.ratio(x, y) / 100.0 for x, y in zip(n1, n2)]
+        feat['name_jaro_winkler'] = [JaroWinkler.normalized_similarity(x, y) for x, y in zip(n1, n2)]
+        feat['name_token_sort'] = [fuzz.token_sort_ratio(x, y) / 100.0 for x, y in zip(n1, n2)]
+        feat['name_token_set'] = [fuzz.token_set_ratio(x, y) / 100.0 for x, y in zip(n1, n2)]
+
+        feat['addr_lev_dist'] = [Levenshtein.distance(x, y) for x, y in zip(a1, a2)]
+        feat['addr_lev_ratio'] = [fuzz.ratio(x, y) / 100.0 for x, y in zip(a1, a2)]
+        feat['addr_jaro_winkler'] = [JaroWinkler.normalized_similarity(x, y) for x, y in zip(a1, a2)]
+        feat['addr_token_sort'] = [fuzz.token_sort_ratio(x, y) / 100.0 for x, y in zip(a1, a2)]
+
+        feat['name_exact_match'] = ((n1 == n2) & (n1 != "")).astype(int)
+        feat['addr_exact_match'] = ((a1 == a2) & (a1 != "")).astype(int)
+
+        n1_first = n1.str.split().str[0].fillna('')
+        n2_first = n2.str.split().str[0].fillna('')
+        feat['name_first_token'] = (n1_first == n2_first).astype(int)
+
+        n1_acr = n1.apply(_acronym)
+        n2_acr = n2.apply(_acronym)
+        feat['name_acronym_match'] = (((n1_acr == n2) & (n1_acr != "")) | ((n2_acr == n1) & (n2_acr != ""))).astype(int)
+
+        # --- numeric / structured fields ---
+        if 's1_nums_name' in df.columns:
+            empty_fs = frozenset()
+            s1_nn = df['s1_nums_name'].apply(lambda x: x if isinstance(x, frozenset) else empty_fs)
+            c_nn = df['c_nums_name'].apply(lambda x: x if isinstance(x, frozenset) else empty_fs)
+            s1_na = df['s1_nums_address'].apply(lambda x: x if isinstance(x, frozenset) else empty_fs)
+            c_na = df['c_nums_address'].apply(lambda x: x if isinstance(x, frozenset) else empty_fs)
+            feat['nums_name_jaccard'] = list(map(_jaccard_row, zip(s1_nn, c_nn)))
+            feat['nums_addr_jaccard'] = list(map(_jaccard_row, zip(s1_na, c_na)))
+            overlap_name = [len(a & b) for a, b in zip(s1_nn, c_nn)]
+            overlap_addr = [len(a & b) for a, b in zip(s1_na, c_na)]
+            feat['nums_overlap_count'] = np.array(overlap_name) + np.array(overlap_addr)
+            feat['nums_conflict_flag'] = ((s1_na.apply(len) > 0) & (c_na.apply(len) > 0) & (feat['nums_addr_jaccard'] < 1.0)).astype(int)
+        else:
+            feat['nums_name_jaccard'] = 0.0
+            feat['nums_addr_jaccard'] = 0.0
+            feat['nums_overlap_count'] = 0
+            feat['nums_conflict_flag'] = 0
+
+        if 's1_street_num' in df.columns:
+            s1_sn = df['s1_street_num'].fillna('')
+            c_sn = df['c_street_num'].fillna('')
+            feat['street_num_match'] = ((s1_sn == c_sn) & (s1_sn != "")).astype(int)
+            feat['street_num_conflict'] = ((s1_sn != c_sn) & (s1_sn != "") & (c_sn != "")).astype(int)
+        if 's1_postal_code' in df.columns:
+            s1_pc = df['s1_postal_code'].fillna('')
+            c_pc = df['c_postal_code'].fillna('')
+            feat['postal_code_match'] = ((s1_pc == c_pc) & (s1_pc != "")).astype(int)
+            feat['postal_code_conflict'] = ((s1_pc != c_pc) & (s1_pc != "") & (c_pc != "")).astype(int)
+        if 's1_country_norm' in df.columns:
+            s1_c = df['s1_country_norm'].fillna('unknown')
+            c_c = df['c_country_norm'].fillna('unknown')
+            feat['country_match'] = ((s1_c == c_c) & (s1_c != 'unknown')).astype(int)
+            feat['country_conflict'] = ((s1_c != c_c) & (s1_c != 'unknown') & (c_c != 'unknown')).astype(int)
+
+        feat['name_len_diff_ratio'] = (n1.str.len() - n2.str.len()).abs() / np.maximum(1, np.maximum(n1.str.len(), n2.str.len()))
+        feat['addr_len_diff_ratio'] = (a1.str.len() - a2.str.len()).abs() / np.maximum(1, np.maximum(a1.str.len(), a2.str.len()))
+
+        feat['target_source'] = np.where(df['candidate_entity_id'].astype(str).str.startswith('S2'), 1, 2)
+
+        # --- dense embedding similarity (reused from blocking when available) ---
+        embeddings = self._ensure_embeddings(df_s1, df_cand, embeddings)
+        s1_ids = df['source1_entity_id'].values
+        c_ids = df['candidate_entity_id'].values
+        dim = len(next(iter(embeddings.values()))) if embeddings else 0
+        if dim:
+            s1_mat = np.array([embeddings.get(i, np.zeros(dim)) for i in s1_ids], dtype='float32')
+            c_mat = np.array([embeddings.get(i, np.zeros(dim)) for i in c_ids], dtype='float32')
+            s1_norm = np.linalg.norm(s1_mat, axis=1)
+            c_norm = np.linalg.norm(c_mat, axis=1)
+            denom = np.where((s1_norm * c_norm) == 0, 1.0, s1_norm * c_norm)
+            cos = np.einsum('ij,ij->i', s1_mat, c_mat) / denom
+            feat['combined_emb_cos'] = cos
+        else:
+            feat['combined_emb_cos'] = 0.0
+
+        # --- retrieval scores from blocking (nearly free signal -- these were
+        # computed already during candidate generation and previously discarded) ---
+        if pair_scores_df is not None and not pair_scores_df.empty:
+            feat = feat.merge(pair_scores_df[['source1_entity_id', 'candidate_entity_id', 'tfidf_score', 'dense_score']],
+                               on=['source1_entity_id', 'candidate_entity_id'], how='left')
+            feat['tfidf_score'] = feat['tfidf_score'].fillna(0.0).astype('float64')
+            feat['dense_score'] = feat['dense_score'].fillna(0.0).astype('float64')
+        else:
+            feat['tfidf_score'] = 0.0
+            feat['dense_score'] = 0.0
+
+        feat['retrieval_score'] = np.maximum(feat['tfidf_score'], feat['dense_score'])
+        grp = feat.groupby(['source1_entity_id', 'target_source'])['retrieval_score']
+        feat['retrieval_rank_in_source'] = grp.rank(method='first', ascending=False)
+        top2 = grp.transform(lambda s: s.nlargest(2).iloc[-1] if len(s) > 1 else s.iloc[0])
+        feat['retrieval_margin_in_source'] = feat['retrieval_score'] - top2
+
+        return feat
