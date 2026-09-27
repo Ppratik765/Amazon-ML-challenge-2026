@@ -1,7 +1,7 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** Antigravity  
-**Team Members:** Antigravity  
+**Team Name:** Priyanshu  
+**Team Members:** Priyanshu Pratik  
 **Submission Date:** 2026-09-26
 
 ---
