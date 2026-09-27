@@ -2,7 +2,7 @@ import pandas as pd
 import re
 import unidecode
 
-SUFFIX_RE = re.compile(r'\b(corp|corporation|inc|pvt|ltd|co|llc|gmbh|sarl|plc|bv|nv|srl|spa)\b')
+SUFFIX_RE = re.compile(r'\b(corp|corporation|inc|pvt|ltd|co|llc|gmbh|sarl|sas|sasu|eurl|plc|bv|nv|srl|spa)\b')
 NON_ALNUM_RE = re.compile(r'[^a-z0-9\s]')
 MULTI_SPACE_RE = re.compile(r'\s+')
 NUM_RE = re.compile(r'\b\d+\b')

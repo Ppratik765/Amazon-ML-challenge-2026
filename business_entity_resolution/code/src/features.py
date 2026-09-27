@@ -168,20 +168,27 @@ class FeatureExtractor:
             feat['combined_emb_cos'] = 0.0
 
         # --- retrieval scores from blocking (nearly free signal -- these were
-        # computed already during candidate generation and previously discarded) ---
-        if pair_scores_df is not None and not pair_scores_df.empty:
-            feat = feat.merge(pair_scores_df[['source1_entity_id', 'candidate_entity_id', 'tfidf_score', 'dense_score']],
-                               on=['source1_entity_id', 'candidate_entity_id'], how='left')
-            feat['tfidf_score'] = feat['tfidf_score'].fillna(0.0).astype('float64')
-            feat['dense_score'] = feat['dense_score'].fillna(0.0).astype('float64')
-        else:
-            feat['tfidf_score'] = 0.0
-            feat['dense_score'] = 0.0
+        # computed already during candidate generation and previously discarded),
+        # plus the rank/margin/mutual-nearest-neighbor columns from
+        # blocking.enrich_pair_scores. All of these MUST come from the full,
+        # pre-split, pre-downsampling candidate pool (see enrich_pair_scores'
+        # docstring) -- computing them here on whatever subset of pairs this
+        # particular call happens to cover would silently differ between a
+        # downsampled training call and a full-pool inference call.
+        score_cols = ['tfidf_score', 'dense_score', 'retrieval_score', 'retrieval_margin_in_source', 'is_mutual_top1']
+        rank_cols = ['retrieval_rank_in_source', 'rank_for_candidate']
 
-        feat['retrieval_score'] = np.maximum(feat['tfidf_score'], feat['dense_score'])
-        grp = feat.groupby(['source1_entity_id', 'target_source'])['retrieval_score']
-        feat['retrieval_rank_in_source'] = grp.rank(method='first', ascending=False)
-        top2 = grp.transform(lambda s: s.nlargest(2).iloc[-1] if len(s) > 1 else s.iloc[0])
-        feat['retrieval_margin_in_source'] = feat['retrieval_score'] - top2
+        if pair_scores_df is not None and not pair_scores_df.empty:
+            available = [c for c in score_cols + rank_cols if c in pair_scores_df.columns]
+            feat = feat.merge(pair_scores_df[['source1_entity_id', 'candidate_entity_id'] + available],
+                               on=['source1_entity_id', 'candidate_entity_id'], how='left')
+
+        for c in score_cols:
+            feat[c] = feat[c].fillna(0.0).astype('float64') if c in feat.columns else 0.0
+        for c in rank_cols:
+            # 9999 = "never retrieved" -- worse than any real rank, so a pair
+            # missing from the enriched pool (e.g. a manually-injected
+            # missing-gt-match training row) never looks like a top candidate.
+            feat[c] = feat[c].fillna(9999.0).astype('float64') if c in feat.columns else 9999.0
 
         return feat

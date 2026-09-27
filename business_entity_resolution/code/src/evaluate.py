@@ -123,6 +123,70 @@ def score_thresholds(base, zero_candidate_ids, gt_dict, threshold_s2, threshold_
     return total_score / total_n if total_n else 0.0
 
 
+def resolve_conflicts(scored_df, threshold_s2, threshold_s3, cap=1):
+    """
+    Source 1 is explicitly the deduplicated reference set -- every real-world
+    business appears exactly once there. That means a given Source-2 or
+    Source-3 record can genuinely belong to at most one Source-1 entity, even
+    though one Source-1 entity can rightly claim several Source-2/Source-3
+    records (duplicates *within* S2/S3 of the same real business). Independent
+    per-S1 thresholding (score_thresholds above) can still let two different S1
+    entities both claim the same candidate above threshold -- F0.5 then scores
+    that as a false positive on whichever one is wrong.
+
+    This computes the same independent top-cap-within-its-own-group selection
+    score_thresholds/grid_search_thresholds optimize, then ONLY REMOVES entries
+    from it to break ties on a shared candidate (highest confidence keeps the
+    claim) -- it never substitutes in a different pick for the loser (an earlier
+    version did, by sorting globally and letting a loser fall through to a
+    lower-ranked-in-its-own-group candidate; that let it change WHICH pairs are
+    considered, not just resolve a tie, and could turn a correct empty/singleton
+    prediction into a wrong one).
+
+    IMPORTANT -- this is a bet, not a guaranteed improvement: it trusts the
+    model's own confidence ordering to decide who keeps a disputed candidate.
+    When that ordering is right, this only removes duplicate false positives and
+    strictly helps. When two S1 entities compete for a candidate that is truly
+    only one of theirs, and the model happens to be MORE confident about the
+    WRONG claim than the RIGHT one (a real calibration error, not a hypothetical
+    one -- verified directly: it happens on both a real leave-one-country-out
+    diagnostic run and in randomized testing here), this can steal a genuine
+    true positive from its rightful entity and give the macro-averaged F0.5 a
+    net loss on that swap, even though it only ever removes entries. Do not
+    apply this by default -- compare macro_f_0_5 with and without it on your own
+    holdout split (train.py does this, and picks whichever wins; see
+    USE_CONFLICT_RESOLUTION in thresholds.json) rather than assuming it helps.
+
+    Returns {source1_entity_id: set(candidate_entity_id)} -- NOT filled in with
+    empty sets for every required S1 id; callers should reindex against the
+    full required id list themselves (macro_f_0_5's gt_dict.items() loop and
+    pipeline.py's final reindex both already do this).
+    """
+    df = scored_df.copy()
+    df['thresh'] = np.where(df['target_source'].values == 1, threshold_s2, threshold_s3)
+    df = df[df['prob'].values >= df['thresh'].values]
+    if df.empty:
+        return {}
+
+    # The independent selection: same rule score_thresholds uses. Restricting to
+    # this set BEFORE resolving conflicts is what makes this a pure removal.
+    df['rank_in_source'] = df.groupby(['source1_entity_id', 'target_source'])['prob'] \
+        .rank(method='first', ascending=False)
+    df = df[df['rank_in_source'].values <= cap]
+    if df.empty:
+        return {}
+
+    df = df.sort_values('prob', ascending=False)
+    claimed_candidates = set()
+    pred_dict = {}
+    for s1, cid in zip(df['source1_entity_id'].values, df['candidate_entity_id'].values):
+        if cid in claimed_candidates:
+            continue
+        claimed_candidates.add(cid)
+        pred_dict.setdefault(s1, set()).add(cid)
+    return pred_dict
+
+
 def grid_search_thresholds(pairs_df, gt_dict, all_s1_ids,
                             threshold_grid=None, caps=(1, 2, 3, 5, 10)):
     """Coarse-to-reasonable grid search over (threshold_s2, threshold_s3, cap)

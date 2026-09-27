@@ -202,3 +202,42 @@ def cap_candidates_per_source(pair_scores_df, max_per_source=30):
         .rank(method='first', ascending=False)
     kept = df[df['_rank'] <= max_per_source].drop(columns=['_rank', 'target_source', 'retrieval_score'])
     return kept.reset_index(drop=True)
+
+
+def enrich_pair_scores(pair_scores_df):
+    """
+    Adds rank / margin / mutual-nearest-neighbor columns computed on the FULL
+    (post-cap) candidate pool, once, before any train/val/holdout split or
+    negative downsampling happens.
+
+    This has to happen before the split: retrieval_rank_in_source computed on a
+    randomly downsampled set of training negatives would not reflect a
+    candidate's true rank among ALL of an S1 entity's real candidates, and would
+    silently differ between what the model trains on (rank among ~15 sampled
+    pairs) and what it sees at real inference time (rank among the full ~30-per-
+    source pool) -- a train/inference mismatch for exactly the feature meant to
+    capture "is this clearly the best option."
+
+    is_mutual_top1 is the classic reciprocal-best-match signal from record
+    linkage / bitext mining: a candidate is much stronger evidence of a true
+    match if it's this S1 entity's top choice AND this S1 entity is, in turn,
+    that candidate's top choice among every S1 entity that considers it a
+    candidate -- i.e. neither side has a better alternative available. One-
+    directional "top-1" (rank in source only) misses this.
+    """
+    if pair_scores_df.empty:
+        return pair_scores_df
+    df = pair_scores_df.copy()
+    df['target_source'] = np.where(df['candidate_entity_id'].astype(str).str.startswith('S2'), 1, 2)
+    df['retrieval_score'] = np.maximum(df['tfidf_score'], df['dense_score'])
+
+    s1_grp = df.groupby(['source1_entity_id', 'target_source'])['retrieval_score']
+    df['retrieval_rank_in_source'] = s1_grp.rank(method='first', ascending=False)
+    top2 = s1_grp.transform(lambda s: s.nlargest(2).iloc[-1] if len(s) > 1 else s.iloc[0])
+    df['retrieval_margin_in_source'] = df['retrieval_score'] - top2
+
+    cand_grp = df.groupby('candidate_entity_id')['retrieval_score']
+    df['rank_for_candidate'] = cand_grp.rank(method='first', ascending=False)
+    df['is_mutual_top1'] = ((df['retrieval_rank_in_source'] == 1) & (df['rank_for_candidate'] == 1)).astype(int)
+
+    return df.drop(columns=['target_source'])

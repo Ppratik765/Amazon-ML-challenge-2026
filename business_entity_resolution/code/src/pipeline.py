@@ -8,8 +8,9 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.preprocess import preprocess_df
-from src.blocking import BlockingEngine, cap_candidates_per_source
+from src.blocking import BlockingEngine, cap_candidates_per_source, enrich_pair_scores
 from src.features import FeatureExtractor
+from src.evaluate import resolve_conflicts
 
 DATA_DIR = os.environ.get('AMZ_ML_TEST_DIR', '../../dataset/test')
 OUT_DIR = os.environ.get('AMZ_ML_OUT_DIR', '../../output')
@@ -35,6 +36,11 @@ def run_pipeline():
     # be "the final candidate list just before the ML model scores them," not the
     # raw union straight out of blocking.
     pair_scores_df = cap_candidates_per_source(pair_scores_df, max_per_source=MAX_CANDIDATES_PER_SOURCE)
+    # Same rank/margin/mutual-nearest-neighbor enrichment used at training time,
+    # computed on this same full (post-cap) pool -- see enrich_pair_scores'
+    # docstring. Must happen before feature extraction so the features the model
+    # sees at inference match what it was trained on.
+    pair_scores_df = enrich_pair_scores(pair_scores_df)
 
     os.makedirs(OUT_DIR, exist_ok=True)
     all_s1_ids = df_s1['entity_id'].tolist()
@@ -77,6 +83,7 @@ def run_pipeline():
     threshold_s2 = th['threshold_s2']
     threshold_s3 = th['threshold_s3']
     cap = th['cap_per_source']
+    use_conflict_resolution = th.get('use_conflict_resolution', False)
 
     X = features_df.reindex(columns=feature_columns, fill_value=0.0).values
     probs = model.predict_proba(X)[:, 1]
@@ -87,13 +94,25 @@ def run_pipeline():
         'target_source': features_df['target_source'].values,
         'prob': probs,
     })
-    scored['thresh'] = np.where(scored['target_source'] == 1, threshold_s2, threshold_s3)
-    scored['rank'] = scored.groupby(['source1_entity_id', 'target_source'])['prob'] \
-        .rank(method='first', ascending=False)
 
-    final_matches = scored[(scored['rank'] <= cap) & (scored['prob'] >= scored['thresh'])]
-    matched_grouped = final_matches.groupby('source1_entity_id')['candidate_entity_id'] \
-        .apply(lambda s: ",".join(sorted(s.unique())))
+    if use_conflict_resolution:
+        # train.py measured this to beat independent per-S1 decisions on holdout
+        # for this particular trained model -- see evaluate.resolve_conflicts'
+        # docstring for why this is a data-driven choice, not an assumed win.
+        pred_dict = resolve_conflicts(scored, threshold_s2, threshold_s3, cap)
+    else:
+        scored['thresh'] = np.where(scored['target_source'] == 1, threshold_s2, threshold_s3)
+        scored['rank'] = scored.groupby(['source1_entity_id', 'target_source'])['prob'] \
+            .rank(method='first', ascending=False)
+        final_matches = scored[(scored['rank'] <= cap) & (scored['prob'] >= scored['thresh'])]
+        pred_dict = {s1: set(g['candidate_entity_id']) for s1, g in final_matches.groupby('source1_entity_id')}
+
+    match_rows = [
+        {'source1_entity_id': s1, 'matched_entity_ids': ",".join(sorted(cands))}
+        for s1, cands in pred_dict.items()
+    ]
+    matched_grouped = pd.DataFrame(match_rows, columns=['source1_entity_id', 'matched_entity_ids']) \
+        .set_index('source1_entity_id')['matched_entity_ids']
     match_out = matched_grouped.reindex(all_s1_ids, fill_value="").reset_index()
     match_out.columns = ['source1_entity_id', 'matched_entity_ids']
     match_out.to_csv(os.path.join(OUT_DIR, 'matching_results.tsv'), sep='\t', index=False)
